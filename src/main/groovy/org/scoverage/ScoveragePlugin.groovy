@@ -13,12 +13,16 @@ import org.gradle.api.tasks.testing.Test
 
 import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
+import org.gradle.api.provider.Provider
+import org.gradle.api.tasks.Sync
+import org.gradle.api.tasks.util.PatternFilterable
 
 import static groovy.io.FileType.FILES
 
 class ScoveragePlugin implements Plugin<PluginAware> {
 
     static final String CONFIGURATION_NAME = 'scoverage'
+    static final String MERGE_MEASUREMENTS_NAME = 'mergeScoverageMeasurements'
     static final String REPORT_NAME = 'reportScoverage'
     static final String CHECK_NAME = 'checkScoverage'
     static final String COMPILE_NAME = 'compileScoverageScala'
@@ -86,6 +90,23 @@ class ScoveragePlugin implements Plugin<PluginAware> {
     }
 
     private void createTasks(Project project, ScoverageExtension extension) {
+        /**
+         dataDir is split into subdirectories:
+         workDir
+         {testTaskName}MeasurementsDir
+         {testTaskName}ReportDir.
+         workDir
+         Directory where metadata/measurements are "produced"
+         Two tasks produce files in that directory: compile and test. Because of that, this directory is not
+         cacheable.
+         Only one file from this directory is cached: metadata from compile task (because it is a single file).
+         testMeasurementsDir
+         Directory where measurements are synced from "workDir". It is registered as an additional output to test task,
+         which makes the measurements files cacheable.
+         reportDir
+         Merges workDir/scoverage.coverage and testMeasurementsDir/scoverage.measurements.* for reporting.
+         */
+        def dataWorkDir = extension.dataDir.map { new File(it, "work") }
 
         ScoverageRunner scoverageRunner = new ScoverageRunner(project.configurations.scoverage)
 
@@ -107,6 +128,9 @@ class ScoveragePlugin implements Plugin<PluginAware> {
         def compileTask = project.tasks[instrumentedSourceSet.getCompileTaskName("scala")]
         compileTask.mustRunAfter(originalCompileTask)
 
+        // merges measurements from individual reports into one directory for use by globalReportTask
+        def globalMergeMeasurementsTask = project.tasks.register(MERGE_MEASUREMENTS_NAME, Sync.class)
+
         def globalReportTask = project.tasks.register(REPORT_NAME, ScoverageAggregate)
         def globalCheckTask = project.tasks.register(CHECK_NAME)
 
@@ -123,17 +147,31 @@ class ScoveragePlugin implements Plugin<PluginAware> {
             List<ScoverageReport> reportTasks = testTasks.collect { testTask ->
                 testTask.mustRunAfter(compileTask)
 
-                def reportTaskName = "report${testTask.name.capitalize()}Scoverage"
-                def taskReportDir = project.file("${project.buildDir}/reports/scoverage${testTask.name.capitalize()}")
+                def cTaskName = testTask.name.capitalize()
+
+                def reportTaskName = "report${cTaskName}Scoverage"
+                def taskReportDir = project.file("${project.buildDir}/reports/scoverage${cTaskName}")
+
+                def scoverageSyncMetaWithOutputs =
+                        project.tasks.register("sync${cTaskName}ScoverageData", Sync.class)
+
+                scoverageSyncMetaWithOutputs.configure {
+                    dependsOn compileTask, testTask
+                    from(dataWorkDir) {
+                        include("scoverage.coverage")
+                    }
+                    from(dataMeasurementsDir(extension, cTaskName))
+                    into(dataReportDir(extension, cTaskName))
+                }
 
                 project.tasks.create(reportTaskName, ScoverageReport) {
-                    dependsOn originalJarTask, compileTask, testTask
-                    onlyIf { extension.dataDir.get().list() }
+                    dependsOn originalJarTask, compileTask, testTask, scoverageSyncMetaWithOutputs
+                    onlyIf { scoverageSyncMetaWithOutputs.get().getDestinationDir().list() }
                     group = 'verification'
                     runner = scoverageRunner
                     reportDir = taskReportDir
                     sources = originalSourceSet.scala.getSourceDirectories()
-                    dataDir = extension.dataDir
+                    dataDir = scoverageSyncMetaWithOutputs.map { it.getDestinationDir() }
                     sourceEncoding.set(detectedSourceEncoding)
                     coverageOutputCobertura = extension.coverageOutputCobertura
                     coverageOutputXML = extension.coverageOutputXML
@@ -142,17 +180,31 @@ class ScoveragePlugin implements Plugin<PluginAware> {
                 }
             }
 
-            globalReportTask.configure {
+            globalMergeMeasurementsTask.configure { sync ->
+                dependsOn(reportTasks)
+                dependsOn(compileTask)
+
                 def dataDirs = reportTasks.findResults { it.dataDir.get() }
 
-                dependsOn reportTasks
-                onlyIf { dataDirs.any { it.list() } }
+                from(dataWorkDir.map { new File(it, 'scoverage.coverage') })
+                from(dataDirs) {
+                    exclude("scoverage.coverage")
+                }
+                into(project.file("${project.buildDir}/mergedScoverage"))
+            }
+
+            globalReportTask.configure {
+                dependsOn globalMergeMeasurementsTask
+
+                onlyIf { globalMergeMeasurementsTask.get().getDestinationDir().list() }
+
+                def dataDirs = reportTasks.findResults { it.dataDir.get() }
 
                 group = 'verification'
                 runner = scoverageRunner
                 reportDir = extension.reportDir
                 sources = originalSourceSet.scala.getSourceDirectories()
-                dirsToAggregateFrom = dataDirs
+                dirsToAggregateFrom = globalMergeMeasurementsTask.map { [it.getDestinationDir()] }
                 sourceEncoding.set(detectedSourceEncoding)
                 deleteReportsOnAggregation = false
                 coverageOutputCobertura = extension.coverageOutputCobertura
@@ -171,8 +223,12 @@ class ScoveragePlugin implements Plugin<PluginAware> {
                 }
 
                 def scalaVersion = resolveScalaVersions(project)
+
+                // the compile task creates a store of measured statements
+                outputs.file(dataWorkDir.map { new File(it, 'scoverage.coverage') })
+
                 if (scalaVersion.majorVersion < 3) {
-                    parameters.add("-P:scoverage:dataDir:${extension.dataDir.get().absolutePath}".toString())
+                    parameters.add("-P:scoverage:dataDir:${dataWorkDir.get().absolutePath}".toString())
                     parameters.add("-P:scoverage:sourceRoot:${extension.project.getRootDir().absolutePath}".toString())
                     if (extension.excludedPackages.get()) {
                         def packages = extension.excludedPackages.get().join(';')
@@ -197,8 +253,8 @@ class ScoveragePlugin implements Plugin<PluginAware> {
                          */
                         def pluginFiles = project.configurations[CONFIGURATION_NAME].findAll {
                             it.name.startsWith("scalac-scoverage-plugin") ||
-                            it.name.startsWith("scalac-scoverage-domain") ||
-                            it.name.startsWith("scalac-scoverage-serializer")
+                                    it.name.startsWith("scalac-scoverage-domain") ||
+                                    it.name.startsWith("scalac-scoverage-serializer")
                         }.collect {
                             it.absolutePath
                         }
@@ -206,7 +262,7 @@ class ScoveragePlugin implements Plugin<PluginAware> {
                     }
                 } else {
                     parameters.add("-sourceroot:${project.rootDir.absolutePath}".toString())
-                    parameters.add("-coverage-out:${extension.dataDir.get().absolutePath}".toString())
+                    parameters.add("-coverage-out:${dataWorkDir.get().absolutePath}".toString())
                     if (extension.excludedPackages.get()) {
                         def packages = extension.excludedPackages.get().join(',')
                         parameters.add("-coverage-exclude-classlikes:$packages".toString())
@@ -277,127 +333,136 @@ class ScoveragePlugin implements Plugin<PluginAware> {
 
                             classpath = project.configurations.scoverage + instrumentedSourceSet.output + classpath
 
-                            outputs.upToDateWhen {
-                                extension.dataDir.get().listFiles(new FilenameFilter() {
-                                    @Override
-                                    boolean accept(File dir, String name) {
-                                        name.startsWith("scoverage.measurements.")
-                                    }
-                                })
+                            doLast {
+                                project.sync {
+                                    from(dataWorkDir)
+                                    exclude("scoverage.coverage")
+                                    into(dataMeasurementsDir(extension, cTaskName))
+                                }
+                                project.delete(project.fileTree(dataWorkDir).exclude("scoverage.coverage"))
                             }
+
+                            outputs.dir(dataMeasurementsDir(extension, cTaskName)).withPropertyName("scoverage.measurements")
                         }
                     }
                 }
             }
+        }
 
-            // define aggregation task
-            if (!project.subprojects.empty) {
-                project.gradle.projectsEvaluated {
-                    project.subprojects.each {
-                        if (it.plugins.hasPlugin(ScalaPlugin) && !it.plugins.hasPlugin(ScoveragePlugin)) {
-                            it.logger.warn("Scala sub-project '${it.name}' doesn't have Scoverage applied and will be ignored in parent project aggregation")
-                        }
+        // define aggregation task
+        if (!project.subprojects.empty) {
+            project.gradle.projectsEvaluated {
+                project.subprojects.each {
+                    if (it.plugins.hasPlugin(ScalaPlugin) && !it.plugins.hasPlugin(ScoveragePlugin)) {
+                        it.logger.warn("Scala sub-project '${it.name}' doesn't have Scoverage applied and will be ignored in parent project aggregation")
                     }
-                    def childReportTasks = project.subprojects.findResults {
-                        it.tasks.find { task ->
-                            task.name == REPORT_NAME && task instanceof ScoverageAggregate
-                        }
-                    }
-                    def allReportTasks = childReportTasks + globalReportTask.get()
-                    def allSources = project.objects.fileCollection()
-                    allReportTasks.each {
-                        allSources = allSources.plus(it.sources.get())
-                    }
-                    def aggregationTask = project.tasks.create(AGGREGATE_NAME, ScoverageAggregate) {
-                        def dataDirs = allReportTasks.findResults { it.dirsToAggregateFrom.get() }.flatten()
-                        onlyIf {
-                            !childReportTasks.empty
-                        }
-                        dependsOn(allReportTasks)
-                        group = 'verification'
-                        runner = scoverageRunner
-                        reportDir = extension.reportDir
-                        sources = allSources
-                        sourceEncoding.set(detectedSourceEncoding)
-                        dirsToAggregateFrom = dataDirs
-                        deleteReportsOnAggregation = extension.deleteReportsOnAggregation
-                        coverageOutputCobertura = extension.coverageOutputCobertura
-                        coverageOutputXML = extension.coverageOutputXML
-                        coverageOutputHTML = extension.coverageOutputHTML
-                        coverageDebug = extension.coverageDebug
-                    }
-                    project.tasks[CHECK_NAME].mustRunAfter(aggregationTask)
                 }
+                def childReportTasks = project.subprojects.findResults {
+                    it.tasks.find { task ->
+                        task.name == REPORT_NAME && task instanceof ScoverageAggregate
+                    }
+                }
+                def allReportTasks = childReportTasks + globalReportTask.get()
+                def allSources = project.objects.fileCollection()
+                allReportTasks.each {
+                    allSources = allSources.plus(it.sources.get())
+                }
+                def aggregationTask = project.tasks.create(AGGREGATE_NAME, ScoverageAggregate) {
+                    def dataDirs = allReportTasks.findResults { it.dirsToAggregateFrom.get() }.flatten()
+                    onlyIf {
+                        !childReportTasks.empty
+                    }
+                    dependsOn(allReportTasks)
+                    group = 'verification'
+                    runner = scoverageRunner
+                    reportDir = extension.reportDir
+                    sources = allSources
+                    sourceEncoding.set(detectedSourceEncoding)
+                    dirsToAggregateFrom = dataDirs
+                    deleteReportsOnAggregation = extension.deleteReportsOnAggregation
+                    coverageOutputCobertura = extension.coverageOutputCobertura
+                    coverageOutputXML = extension.coverageOutputXML
+                    coverageOutputHTML = extension.coverageOutputHTML
+                    coverageDebug = extension.coverageDebug
+                }
+                project.tasks[CHECK_NAME].mustRunAfter(aggregationTask)
             }
         }
     }
+}
 
-    private void configureCheckTask(Project project, ScoverageExtension extension,
-                                    TaskProvider<Task> globalCheckTask,
-                                    TaskProvider<ScoverageAggregate> globalReportTask) {
+private Provider<File> dataMeasurementsDir(ScoverageExtension extension, String testName) {
+    return extension.dataDir.map {new File(it, "${testName}Measurements") }
+}
 
-        if (extension.checks.isEmpty()) {
-            extension.check {
-                minimumRate = extension.minimumRate.getOrElse(BigDecimal.valueOf(ScoverageExtension.DEFAULT_MINIMUM_RATE))
-                coverageType = extension.coverageType.getOrElse(ScoverageExtension.DEFAULT_COVERAGE_TYPE)
-            }
-        } else if (extension.minimumRate.isPresent() || extension.coverageType.isPresent()) {
-            throw new IllegalArgumentException("Check configuration should be defined in either the new or the old syntax exclusively, not together")
+private Provider<File> dataReportDir(ScoverageExtension extension, String testName) {
+    return extension.dataDir.map { new File(it, "${testName}Report") }
+}
+
+private void configureCheckTask(Project project, ScoverageExtension extension,
+                                TaskProvider<Task> globalCheckTask,
+                                TaskProvider<ScoverageAggregate> globalReportTask) {
+
+    if (extension.checks.isEmpty()) {
+        extension.check {
+            minimumRate = extension.minimumRate.getOrElse(BigDecimal.valueOf(ScoverageExtension.DEFAULT_MINIMUM_RATE))
+            coverageType = extension.coverageType.getOrElse(ScoverageExtension.DEFAULT_COVERAGE_TYPE)
         }
+    } else if (extension.minimumRate.isPresent() || extension.coverageType.isPresent()) {
+        throw new IllegalArgumentException("Check configuration should be defined in either the new or the old syntax exclusively, not together")
+    }
 
-        def checker = new CoverageChecker(project.logger)
+    def checker = new CoverageChecker(project.logger)
 
+    globalCheckTask.configure {
+        group = 'verification'
+        dependsOn globalReportTask
+        onlyIf { extension.reportDir.get().list() }
+    }
+
+    extension.checks.each { config ->
         globalCheckTask.configure {
-            group = 'verification'
-            dependsOn globalReportTask
-            onlyIf { extension.reportDir.get().list() }
-        }
-
-        extension.checks.each { config ->
-            globalCheckTask.configure {
-                doLast {
-                    checker.checkLineCoverage(extension.reportDir.get(), config.coverageType, config.minimumRate.doubleValue())
-                }
+            doLast {
+                checker.checkLineCoverage(extension.reportDir.get(), config.coverageType, config.minimumRate.doubleValue())
             }
         }
     }
+}
 
-    private ScalaVersion resolveScalaVersions(Project project) {
-        def scalaVersionProperty = project.extensions.scoverage.scoverageScalaVersion
-        if (scalaVersionProperty.isPresent()) {
-            def configuredScalaVersion = scalaVersionProperty.get()
-            project.logger.info("Using configured Scala version: $configuredScalaVersion")
-            return new ScalaVersion(configuredScalaVersion)
-        } else {
-            project.logger.info("No Scala version configured. Detecting scala library...")
-            def components = project.configurations.compileClasspath.incoming.resolutionResult.getAllComponents()
+private ScalaVersion resolveScalaVersions(Project project) {
+    def scalaVersionProperty = project.extensions.scoverage.scoverageScalaVersion
+    if (scalaVersionProperty.isPresent()) {
+        def configuredScalaVersion = scalaVersionProperty.get()
+        project.logger.info("Using configured Scala version: $configuredScalaVersion")
+        return new ScalaVersion(configuredScalaVersion)
+    } else {
+        project.logger.info("No Scala version configured. Detecting scala library...")
+        def components = project.configurations.compileClasspath.incoming.resolutionResult.getAllComponents()
 
-            def scala3Library = components.find {
-                it.moduleVersion.group == "org.scala-lang" && it.moduleVersion.name == "scala3-library_3"
-            }
-            def scalaLibrary = components.find {
-                it.moduleVersion.group == "org.scala-lang" && it.moduleVersion.name == "scala-library"
-            }
-
-            // Scala 3
-            if (scala3Library != null) {
-                def scala3Version = scala3Library.moduleVersion.version
-                def scala2Version = scalaLibrary.moduleVersion.version
-                project.logger.info("Detected scala 3 library in compilation classpath. Scala 3 version: $scala3Version; using Scala 2 library: $scala2Version")
-                return new ScalaVersion(scala3Version, Optional.of(scala2Version))
-            }
-
-            // Scala 2
-            if (scalaLibrary != null) {
-                def scala2Version = scalaLibrary.moduleVersion.version
-                project.logger.info("Detected scala library in compilation classpath. Scala version: $scala2Version")
-                return new ScalaVersion(scala2Version)
-            }
-
-            // No Scala library was found, using default Scala version
-            project.logger.info("No scala library detected. Using default Scala version: $DEFAULT_SCALA_VERSION")
-            return new ScalaVersion(DEFAULT_SCALA_VERSION)
+        def scala3Library = components.find {
+            it.moduleVersion.group == "org.scala-lang" && it.moduleVersion.name == "scala3-library_3"
         }
-    }
+        def scalaLibrary = components.find {
+            it.moduleVersion.group == "org.scala-lang" && it.moduleVersion.name == "scala-library"
+        }
 
+        // Scala 3
+        if (scala3Library != null) {
+            def scala3Version = scala3Library.moduleVersion.version
+            def scala2Version = scalaLibrary.moduleVersion.version
+            project.logger.info("Detected scala 3 library in compilation classpath. Scala 3 version: $scala3Version; using Scala 2 library: $scala2Version")
+            return new ScalaVersion(scala3Version, Optional.of(scala2Version))
+        }
+
+        // Scala 2
+        if (scalaLibrary != null) {
+            def scala2Version = scalaLibrary.moduleVersion.version
+            project.logger.info("Detected scala library in compilation classpath. Scala version: $scala2Version")
+            return new ScalaVersion(scala2Version)
+        }
+
+        // No Scala library was found, using default Scala version
+        project.logger.info("No scala library detected. Using default Scala version: $DEFAULT_SCALA_VERSION")
+        return new ScalaVersion(DEFAULT_SCALA_VERSION)
+    }
 }
